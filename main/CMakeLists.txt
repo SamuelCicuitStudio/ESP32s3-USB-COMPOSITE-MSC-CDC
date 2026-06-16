@@ -5,7 +5,8 @@ idf_component_register(
         tinyusb           # bundled TinyUSB — compiled from source in components/tinyusb/
         nvs_flash
         driver
-        esp_driver_sdspi
+        esp_driver_sdspi  # SPI mode (SD_MODE_SPI)
+        esp_driver_sdmmc  # SDMMC native mode (SD_MODE_SDMMC_1B / SD_MODE_SDMMC_4B)
         sdmmc
         log
         heap

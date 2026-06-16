@@ -1,19 +1,19 @@
 /*
  * app_main.c — USB CDC + MSC composite device on ESP32-S3
  *
- * Combines a USB Mass Storage device (SD card via SPI) with a USB CDC
- * serial port on a single USB connector. No extra hardware is needed
- * beyond the SD card wired to SPI.
+ * Combines a USB Mass Storage device (SD card) with a USB CDC serial port
+ * on a single USB connector.
+ *
+ * SD interface mode is selected in main/sd_config.h:
+ *   SD_MODE_SPI      — SD over SPI (sdspi_host)
+ *   SD_MODE_SDMMC_1B — Native SDMMC 1-bit
+ *   SD_MODE_SDMMC_4B — Native SDMMC 4-bit (fastest)
+ *
+ * Pin assignments and clock frequency are also configured in sd_config.h.
  *
  * TinyUSB is compiled from source as a project component (components/tinyusb/).
  * The project has no dependency on esp_tinyusb or any other framework wrapper.
  * USB PHY initialisation uses the standard IDF esp_private/usb_phy.h API.
- *
- * Default pin assignment (SPI3 — change SD_* defines below):
- *   SD CS   → GPIO 38
- *   SD SCK  → GPIO 41
- *   SD MISO → GPIO 42
- *   SD MOSI → GPIO 39
  *
  * What you will see after flashing:
  *   - Windows detects "Geye USB Composite", "Geye CDC Console", and
@@ -29,8 +29,13 @@
 #include <stdarg.h>
 #include <string.h>
 
-#include "driver/sdspi_host.h"
-#include "driver/spi_master.h"
+#include "sd_config.h"
+#if SD_MODE == SD_MODE_SPI
+#  include "driver/sdspi_host.h"
+#  include "driver/spi_master.h"
+#else
+#  include "driver/sdmmc_host.h"
+#endif
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_private/usb_phy.h"
@@ -42,20 +47,15 @@
 
 static const char *TAG = "usb_cdc_msc";
 
-/* ── Pin assignments — change these to match your board ──────────────────── */
-#define SD_CS    38
-#define SD_SCK   41
-#define SD_MISO  42
-#define SD_MOSI  39
-#define SD_HOST  SPI3_HOST
-#define SD_FREQ  4000000     /* 4 MHz — safe for long wires */
 #define MSC_SECTOR_BUFFER_BYTES 4096U
 #define MSC_VOLUME_LABEL "GEYE"      /* drive name shown in Windows Explorer */
 
 /* ── SD card state ───────────────────────────────────────────────────────── */
-static sdmmc_card_t       s_card;
-static bool               s_card_ready = false;
-static sdspi_dev_handle_t s_spi_dev    = -1;
+static sdmmc_card_t s_card;
+static bool         s_card_ready = false;
+#if SD_MODE == SD_MODE_SPI
+static sdspi_dev_handle_t s_spi_dev = -1;
+#endif
 
 /*
  * DMA bounce buffer — must be in internal SRAM, 4-byte aligned.
@@ -252,18 +252,22 @@ static esp_err_t sd_init(void)
     /* Give the card time to power up (spec: ≥1 ms after Vcc stable) */
     vTaskDelay(pdMS_TO_TICKS(100));
 
+    esp_err_t ret;
+
+#if SD_MODE == SD_MODE_SPI
+    /* ── SPI mode ──────────────────────────────────────────────────────────── */
     /* Initialise SPI bus with DMA (SPI_DMA_CH_AUTO picks a free GDMA channel).
      * USB OTG uses its own internal DMA engine, so there is no conflict. */
     const spi_bus_config_t bus = {
-        .mosi_io_num     = SD_MOSI,
-        .miso_io_num     = SD_MISO,
-        .sclk_io_num     = SD_SCK,
+        .mosi_io_num     = SD_SPI_MOSI,
+        .miso_io_num     = SD_SPI_MISO,
+        .sclk_io_num     = SD_SPI_SCK,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
         .max_transfer_sz = 8192,
         .flags           = SPICOMMON_BUSFLAG_MASTER,
     };
-    esp_err_t ret = spi_bus_initialize(SD_HOST, &bus, SPI_DMA_CH_AUTO);
+    ret = spi_bus_initialize(SD_SPI_HOST, &bus, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         blog("SD: SPI bus init FAILED (%s)", esp_err_to_name(ret));
         return ret;
@@ -277,30 +281,64 @@ static esp_err_t sd_init(void)
 
     /* Attach SD card — no card-detect, write-protect, or interrupt pins */
     sdspi_device_config_t dev = SDSPI_DEVICE_CONFIG_DEFAULT();
-    dev.host_id  = SD_HOST;
-    dev.gpio_cs  = SD_CS;
+    dev.host_id  = SD_SPI_HOST;
+    dev.gpio_cs  = SD_SPI_CS;
     dev.gpio_cd  = SDSPI_SLOT_NO_CD;
     dev.gpio_wp  = SDSPI_SLOT_NO_WP;
     dev.gpio_int = SDSPI_SLOT_NO_INT;
 
     ret = sdspi_host_init_device(&dev, &s_spi_dev);
     if (ret != ESP_OK) {
-        blog("SD: attach FAILED (%s)", esp_err_to_name(ret));
+        blog("SD: SPI attach FAILED (%s)", esp_err_to_name(ret));
         return ret;
     }
 
-    /* sdspi always starts negotiation at 400 kHz (SD spec requirement) then
-     * ramps up to max_freq_khz once the card has identified itself. */
-    sdmmc_host_t host   = SDSPI_HOST_DEFAULT();
-    host.slot           = s_spi_dev;
-    host.max_freq_khz   = SD_FREQ / 1000U;
+    /* sdspi negotiates at 400 kHz then ramps to max_freq_khz after card ID */
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot         = s_spi_dev;
+    host.max_freq_khz = SD_SPI_FREQ / 1000U;
+
+#else  /* SD_MODE_SDMMC_1B or SD_MODE_SDMMC_4B */
+    /* ── SDMMC native mode ─────────────────────────────────────────────────── */
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.max_freq_khz = SD_MMC_FREQ / 1000U;
+
+    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot.clk     = SD_MMC_CLK;
+    slot.cmd     = SD_MMC_CMD;
+    slot.d0      = SD_MMC_D0;
+    slot.gpio_cd = SDMMC_SLOT_NO_CD;
+    slot.gpio_wp = SDMMC_SLOT_NO_WP;
+#if SD_MODE == SD_MODE_SDMMC_4B
+    slot.d1      = SD_MMC_D1;
+    slot.d2      = SD_MMC_D2;
+    slot.d3      = SD_MMC_D3;
+    slot.width   = 4;
+#else
+    slot.width   = 1;
+#endif
+
+    ret = sdmmc_host_init();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        blog("SD: SDMMC host init FAILED (%s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = sdmmc_host_init_slot(SDMMC_HOST_SLOT_0, &slot);
+    if (ret != ESP_OK) {
+        blog("SD: SDMMC slot init FAILED (%s)", esp_err_to_name(ret));
+        return ret;
+    }
+#endif /* SD_MODE */
 
     memset(&s_card, 0, sizeof(s_card));
     ret = sdmmc_card_init(&host, &s_card);
     if (ret != ESP_OK) {
         blog("SD: card init FAILED (%s) — check wiring", esp_err_to_name(ret));
+#if SD_MODE == SD_MODE_SPI
         sdspi_host_remove_device(s_spi_dev);
         s_spi_dev = -1;
+#endif
         return ret;
     }
 
@@ -842,8 +880,17 @@ void app_main(void)
     xTaskCreate(cdc_task, "cdc_tx",  3072, NULL, 4, NULL);
 
     /* SD card — MSC reports no media until this succeeds. */
-    blog("SD: SPI3  CS=%d SCK=%d MISO=%d MOSI=%d  %d Hz",
-         SD_CS, SD_SCK, SD_MISO, SD_MOSI, SD_FREQ);
+#if SD_MODE == SD_MODE_SPI
+    blog("SD: SPI  host=%d  CS=%d SCK=%d MISO=%d MOSI=%d  %d Hz",
+         (int)SD_SPI_HOST, SD_SPI_CS, SD_SPI_SCK, SD_SPI_MISO, SD_SPI_MOSI, SD_SPI_FREQ);
+#elif SD_MODE == SD_MODE_SDMMC_1B
+    blog("SD: SDMMC 1-bit  CLK=%d CMD=%d D0=%d  %d Hz",
+         (int)SD_MMC_CLK, (int)SD_MMC_CMD, (int)SD_MMC_D0, SD_MMC_FREQ);
+#else
+    blog("SD: SDMMC 4-bit  CLK=%d CMD=%d D0=%d D1=%d D2=%d D3=%d  %d Hz",
+         (int)SD_MMC_CLK, (int)SD_MMC_CMD, (int)SD_MMC_D0,
+         (int)SD_MMC_D1, (int)SD_MMC_D2, (int)SD_MMC_D3, SD_MMC_FREQ);
+#endif
     ret = sd_init();
     if (ret == ESP_OK) {
         uint64_t mb = ((uint64_t)s_card.csd.capacity *

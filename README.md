@@ -1,72 +1,143 @@
-# USB CDC + MSC Composite Device - ESP32-S3
+# USB CDC + MSC Composite Device — ESP32-S3
 
-A complete, self-contained ESP-IDF 5.5.1 project that exposes an SD card
-(connected via SPI) as a **USB Mass Storage device** and simultaneously provides
-a **USB CDC serial port** on a single native ESP32-S3 USB connector.
+A complete, self-contained ESP-IDF 5.5.1 project that exposes an SD card as a
+**USB Mass Storage device** and simultaneously provides a **USB CDC serial port**
+on a single native ESP32-S3 USB connector.
 
-Validated on ESP32-S3 with Espressif ESP-IDF v5.5.1. Confirmed behavior:
-USB enumerates quickly, CDC appears as `Geye CDC Console`, MSC appears as
-`Geye SD Card`, and the SD card is writable from the host computer.
+The SD interface is configurable: choose between **SPI**, **SDMMC 1-bit**, or
+**SDMMC 4-bit** by editing one line in `main/sd_config.h`. No other file needs
+to change.
+
+Validated on ESP32-S3 with ESP-IDF v5.5.1. Confirmed behavior: USB enumerates
+quickly, CDC appears as `Geye CDC Console`, MSC appears as `Geye SD Card`, and
+the SD card is fully readable, writable, and formattable from the host computer.
 
 ---
 
 ## Features
 
 - Composite USB device: CDC serial port + MSC mass storage on one cable.
+- Three SD interface modes selectable via a single `#define` in `sd_config.h`:
+  - **SPI** — works on any GPIO, most compatible, lowest speed.
+  - **SDMMC 1-bit** — native SDMMC peripheral, faster than SPI.
+  - **SDMMC 4-bit** — fastest option; requires 4 data lines.
 - Uses ESP32-S3 native USB OTG with TinyUSB compiled from source in this project.
-- SD card served directly as a raw block device; no FAT mount on the ESP32 side.
+- SD card served as a raw block device; no FAT mount on the ESP32 side.
   Windows, macOS, and Linux see the SD card's native filesystem.
-- CDC port prints SD card identity, type, speed, size, and MSC counters when
-  you type `status`.
-- USB starts before SD probing; if the card is slow or missing, CDC/MSC still
-  enumerate and MSC reports no media until the card is ready.
-- Direct TinyUSB callbacks are used for MSC. `tud_msc_is_writable_cb()` belongs
-  to `main/app_main.c`, so the host sees the SD card as writable.
-- Boot log is buffered in RAM and replayed over CDC the first time a terminal opens,
-  so you never miss startup messages even when the port is not open at boot.
-- No byte-swapping, no filesystem layer, no extra chips; pure SPI SD to USB MSC.
-- DMA-safe sector buffer allocated from internal SRAM with 4-byte alignment.
-- Graceful degradation: if no SD card is inserted, MSC reports "no media" via
-  SCSI SENSE NOT_READY; the CDC port still works.
+- FAT volume label stamped as `GEYE` at boot — the drive shows the name
+  immediately in Windows Explorer without formatting.
+- CDC port replays the full boot log and live counters when you type `status`.
+- USB starts before SD probing: CDC/MSC enumerate even if the card is slow or
+  absent; MSC reports no media until the card is ready.
+- DMA-safe sector buffer in internal SRAM with 4-byte alignment.
+- Graceful degradation: no SD card → MSC reports SCSI NOT_READY; CDC still works.
+
+---
+
+## Quick-Start: Choosing the SD Interface
+
+Open `main/sd_config.h` and change **one line**:
+
+```c
+#define SD_MODE  SD_MODE_SPI        // SPI (default)
+// #define SD_MODE  SD_MODE_SDMMC_1B   // SDMMC 1-bit
+// #define SD_MODE  SD_MODE_SDMMC_4B   // SDMMC 4-bit
+```
+
+Then set the GPIO numbers and clock frequency for your board in the same file
+(see the sections below). Rebuild — done.
 
 ---
 
 ## Hardware Requirements
 
-- **ESP32-S3** development board (any variant with USB OTG pin exposed: D+/D-).
-- **SD card module** wired to SPI (any standard breakout with 3.3 V logic).
-- **USB cable**: one end to the ESP32-S3 USB OTG port, the other to the host PC.
-  This is NOT the UART/programming port; it is the second USB connector typically
-  labelled "USB" or "OTG" on dev boards.
-- **Flash size**: standard 4 MB or larger.
-- **PSRAM**: optional; not used by this project.
+- **ESP32-S3** development board with the USB OTG D+/D− pins exposed.
+- **SD card module** wired according to the mode you selected.
+- **USB cable** from the ESP32-S3 **OTG port** to the host PC.
+  This is the second USB connector (not the UART/programming port).
+- **Flash size**: 4 MB or larger.
+- **PSRAM**: not used by this project.
 
 ---
 
 ## Wiring
 
-Connect your SD card module to the ESP32-S3 as follows:
+### SPI mode (`SD_MODE_SPI`) — default
 
-| SD card pin | ESP32-S3 GPIO | Notes                          |
-|-------------|---------------|--------------------------------|
-| CS          | 38            | Chip select (active LOW)       |
-| SCK / CLK   | 41            | SPI clock                      |
-| MISO / DO   | 42            | Master In, Slave Out           |
-| MOSI / DI   | 39            | Master Out, Slave In           |
-| VCC         | 3.3 V         | Use the 3.3 V rail, NOT 5 V   |
-| GND         | GND           |                                |
+Any SPI-capable GPIOs work. Defaults in `sd_config.h`:
 
-To change the pins, edit the `SD_*` defines at the top of `main/app_main.c`:
+| SD card pin | ESP32-S3 GPIO | `sd_config.h` define |
+|-------------|---------------|----------------------|
+| CS          | 38            | `SD_SPI_CS`          |
+| SCK / CLK   | 41            | `SD_SPI_SCK`         |
+| MISO / DO   | 42            | `SD_SPI_MISO`        |
+| MOSI / DI   | 39            | `SD_SPI_MOSI`        |
+| VCC         | 3.3 V         | —                    |
+| GND         | GND           | —                    |
+
+Default clock: **4 MHz** (`SD_SPI_FREQ`). Safe for long wires and breadboards.
+Raise to `20000000` (20 MHz) for short traces.
+
+No pull-ups required for SPI mode.
+
+### SDMMC 1-bit mode (`SD_MODE_SDMMC_1B`)
+
+| SD card pin | ESP32-S3 GPIO | `sd_config.h` define |
+|-------------|---------------|----------------------|
+| CLK         | 14            | `SD_MMC_CLK`         |
+| CMD         | 15            | `SD_MMC_CMD`         |
+| D0          | 2             | `SD_MMC_D0`          |
+| VCC         | 3.3 V         | —                    |
+| GND         | GND           | —                    |
+
+**Pull-ups required:** 10 kΩ on CMD and D0. The ESP32-S3 does not have internal
+pull-ups strong enough for SDMMC at speed.
+
+### SDMMC 4-bit mode (`SD_MODE_SDMMC_4B`)
+
+| SD card pin | ESP32-S3 GPIO | `sd_config.h` define |
+|-------------|---------------|----------------------|
+| CLK         | 14            | `SD_MMC_CLK`         |
+| CMD         | 15            | `SD_MMC_CMD`         |
+| D0          | 2             | `SD_MMC_D0`          |
+| D1          | 4             | `SD_MMC_D1`          |
+| D2          | 12            | `SD_MMC_D2`          |
+| D3          | 13            | `SD_MMC_D3`          |
+| VCC         | 3.3 V         | —                    |
+| GND         | GND           | —                    |
+
+**Pull-ups required:** 10 kΩ on CMD, D0, D1, D2, D3.
+
+Default clock: **20 MHz** (`SD_MMC_FREQ`). Can be raised to 40 MHz on short
+traces with good pull-ups.
+
+---
+
+## Configuration Reference (`main/sd_config.h`)
 
 ```c
-#define SD_CS    38
-#define SD_SCK   41
-#define SD_MISO  42
-#define SD_MOSI  39
+/* Mode — change this one line */
+#define SD_MODE  SD_MODE_SPI      // SD_MODE_SPI | SD_MODE_SDMMC_1B | SD_MODE_SDMMC_4B
+
+/* SPI pins (used when SD_MODE == SD_MODE_SPI) */
+#define SD_SPI_CS    38
+#define SD_SPI_SCK   41
+#define SD_SPI_MISO  42
+#define SD_SPI_MOSI  39
+#define SD_SPI_HOST  SPI3_HOST   // SPI2_HOST or SPI3_HOST
+#define SD_SPI_FREQ  4000000     // Hz
+
+/* SDMMC pins (used when SD_MODE == SD_MODE_SDMMC_1B or SD_MODE_SDMMC_4B) */
+#define SD_MMC_CLK   14
+#define SD_MMC_CMD   15
+#define SD_MMC_D0    2
+#define SD_MMC_D1    4    // 4-bit only
+#define SD_MMC_D2    12   // 4-bit only
+#define SD_MMC_D3    13   // 4-bit only
+#define SD_MMC_FREQ  20000000    // Hz
 ```
 
-To change the SPI clock speed (default 4 MHz), edit `SD_FREQ`. Do not exceed the
-maximum supported by your SD module or cable length.
+All other project files are left unchanged when you switch modes.
 
 ---
 
@@ -75,221 +146,134 @@ maximum supported by your SD module or cable length.
 ### Prerequisites
 
 - Espressif ESP-IDF v5.5.1 installed and `idf.py` on your PATH.
-- Target board: ESP32-S3.
+- Target: ESP32-S3.
 
 ### Steps
 
 ```bash
 # 1. Enter the project directory
-cd D:\Freelancer\gaby\USB_CDC_MSC
+cd USB_CDC_MSC
 
-# 2. Set target (only needed once; sdkconfig.defaults sets CONFIG_IDF_TARGET)
+# 2. Set target (only needed once)
 idf.py set-target esp32s3
 
 # 3. Build
 idf.py build
 
-# 4. Flash and open the UART monitor (programming port, not OTG port)
+# 4. Flash via the UART/programming port, then open the monitor
 idf.py -p COM3 flash monitor
 ```
 
-Replace `COM3` with the COM port of the **UART/programming** port on your board
-(shown in Device Manager as "Silicon Labs CP210x" or "CH340" or similar). This is
-separate from the USB OTG port.
-
-### Plug in the OTG cable
-
-After flashing, plug a USB cable into the **OTG port** of the ESP32-S3. Windows
-will detect two new devices:
-
-1. A **COM port** labelled "Geye CDC Console".
-2. A **removable drive** labelled "Geye SD Card" pointing to the SD card.
+Replace `COM3` with the COM port of your board's **UART/programming** port
+(not the OTG port). After flashing, plug a USB cable into the **OTG port** and
+Windows will detect two new devices.
 
 ---
 
 ## Expected Output
 
-### UART monitor (programming port)
+### UART monitor
 
 ```
 I (312) usb_cdc_msc: === USB CDC + MSC (SD card) ===
 I (318) usb_cdc_msc: NVS: OK
 I (322) usb_cdc_msc: DMA buf: 0x3fc9e000 (4096 B, internal SRAM)
 I (328) usb_cdc_msc: USB: READY as Geye USB Composite / Geye CDC Console
-I (329) usb_cdc_msc: SD: SPI3  CS=38 SCK=41 MISO=42 MOSI=39  4000000 Hz
-I (891) usb_cdc_msc: SD: READY  name=SC16G  30801920 x 512 B = 14901 MB
-I (892) usb_cdc_msc: SD: type=SDHC/SDXC  speed=4000 kHz
+I (329) usb_cdc_msc: SD: SPI  host=1  CS=38 SCK=41 MISO=42 MOSI=39  4000000 Hz
+I (891) usb_cdc_msc: Volume label 'GEYE       ' written (FAT32 VBR@2048 root@8192)
+I (892) usb_cdc_msc: SD: READY  name=SC16G  30801920 x 512 B = 14901 MB  label=GEYE
+I (893) usb_cdc_msc: SD: type=SDHC/SDXC  speed=4000 kHz
 I (901) usb_cdc_msc: Tasks started. Plug in USB cable.
-I (902) usb_cdc_msc: Type 'status' in CDC terminal to see SD and MSC counters.
 ```
 
-### CDC port (OTG USB COM port) - open with any terminal at any baud rate
+### CDC port — type `status` to query
 
 ```
 === Boot log ===
 === USB CDC + MSC (SD card) ===
 NVS: OK
-DMA buf: 0x3fc9e000 (4096 B, internal SRAM)
-USB: READY as Geye USB Composite / Geye CDC Console
-SD: SPI3  CS=38 SCK=41 MISO=42 MOSI=39  4000000 Hz
-SD: READY  name=SC16G  30801920 x 512 B = 14901 MB
-SD: type=SDHC/SDXC  speed=4000 kHz
-Tasks started. Plug in USB cable.
-Type 'status' in CDC terminal to see SD and MSC counters.
+...
 === SD status ===
 Name   : SC16G
 Type   : SDHC/SDXC
 Speed  : 4000 kHz
 Sectors: 30801920 x 512 B
 Size   : 14901 MB
-MSC    : R=0/0 W=0/0
+MSC    : R=42/0 W=18/0
 LastErr: ESP_OK LBA=0 SCSI=0
 =================
 ```
 
 ### Windows Explorer
 
-The SD card appears as a removable drive. You can read, write, and safely eject it
-just like a USB flash drive. The card's native FAT32 or exFAT filesystem is used;
-no reformatting is needed.
+The SD card appears as a removable drive named **GEYE**. You can read, write,
+format, and safely eject it exactly like a USB flash drive.
 
 ---
 
-## Technical Deep-Dive
+## Technical Notes
 
-### Why SPI3 at 4 MHz - not native SDMMC, not 30 MHz
+### How the SD mode abstraction works
 
-**Not native SDMMC:** The ESP32-S3's native SDMMC peripheral uses specific GPIO
-pins (slots 0 and 1 are mapped to fixed GPIOs on the silicon). Those pins are
-typically occupied by other functions on a given board. The `sdspi` driver allows
-any SPI-capable GPIOs to be used, at the cost of lower maximum throughput.
+`main/sd_config.h` defines the three mode constants and a single `SD_MODE` macro.
+`app_main.c` includes `sd_config.h` first and uses `#if SD_MODE == ...` guards to:
 
-**Not 30 MHz:** The IDF `sdspi` driver has a practical ceiling around 20 MHz on
-SPI3 due to GDMA transfer overhead and the single-wire SPI protocol. More
-importantly, 4 MHz is chosen here as the safe default for breadboard wiring and
-long cable runs. The SPI bus can be shared with other devices (display, sensors)
-by lowering the clock speed to the slowest device's maximum. For a dedicated SD
-card on short traces, you can raise `SD_FREQ` to 20000000 (20 MHz) safely.
+- Pull in either `driver/sdspi_host.h` + `driver/spi_master.h` (SPI mode) or
+  `driver/sdmmc_host.h` (SDMMC modes).
+- Compile `sdspi_dev_handle_t s_spi_dev` only in SPI mode.
+- Choose the correct host and slot init path inside `sd_init()`.
 
-**USB MSC throughput at 4 MHz SPI:** Full-speed USB MSC peaks at ~1 MB/s; SPI at
-4 MHz delivers ~400 kB/s. The bottleneck is USB full-speed, not the SPI clock.
-Raising the SPI clock to 10-20 MHz will not improve USB transfer rates on
-full-speed USB OTG.
+`CMakeLists.txt` lists both `esp_driver_sdspi` and `esp_driver_sdmmc` in REQUIRES
+so the linker has both drivers available regardless of the selected mode.
 
----
+### Why USB starts before SD probing
 
-### How TinyUSB composite CDC+MSC works - IAD and bDeviceClass=0xEF
+TinyUSB is installed first so the CDC console is available immediately, even if
+the SD card is slow or absent. While the card is not ready,
+`tud_msc_test_unit_ready_cb()` returns false and sets SCSI NOT_READY. After
+`sd_init()` succeeds, the MSC LUN reports the real sector count. If the host
+cached the early not-ready state, unplugging and reconnecting the OTG cable
+forces a clean re-enumeration.
 
-A standard USB device can only have one class per device descriptor. To expose
-two different classes (CDC for serial, MSC for storage) on a single USB device,
-the USB specification defines **Interface Association Descriptors (IADs)**. An IAD
-groups consecutive interfaces under a single class driver, allowing the host to
-assign separate drivers to each group.
+### Why `tud_msc_get_maxlun_cb` returns 0
 
-Windows requires the device descriptor to declare:
+Returning 0 means one LUN (LUN 0 = the SD card). Returning 1 would tell the host
+two LUNs exist; it would probe LUN 1, receive ILLEGAL_REQUEST, and Windows would
+mark the drive write-protected.
 
-```
-bDeviceClass    = 0xEF   (Miscellaneous Device Class)
-bDeviceSubClass = 0x02
-bDeviceProtocol = 0x01   (Interface Association Descriptor protocol)
-```
+### DMA bounce buffer
 
-This signals to the Windows USB stack that IADs are present. Without this, Windows
-may attempt to load a single driver for the entire composite device, which fails for
-mixed CDC+MSC combinations.
+`sdmmc_read/write_sectors()` transfers data via GDMA. GDMA requires the buffer
+to be in internal SRAM (not PSRAM) and 4-byte aligned. `heap_caps_aligned_alloc`
+with `MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL` satisfies both constraints. In SDMMC
+native mode the peripheral has its own internal DMA engine, but keeping the buffer
+in internal SRAM is still correct and safe.
 
-The configuration descriptor then contains:
+### FAT volume label
 
-1. A standard configuration header.
-2. A CDC IAD + CDC control interface + CDC data interface.
-3. An MSC interface.
+`sd_set_volume_label()` writes the label to two locations so Windows sees it
+immediately without a reconnect:
+1. The BPB VolumeLabel field in the boot sector (offset 43 for FAT16/12, 71 for FAT32).
+2. A root-directory entry with `ATTR_VOLUME_ID` (0x08) — Windows reads this as authoritative.
 
-The TinyUSB macros `TUD_CDC_DESCRIPTOR` and `TUD_MSC_DESCRIPTOR` generate the
-correct IAD+interface blocks automatically.
+It is called after `sdmmc_card_init()` but before `s_card_ready = true`, so the
+USB host receives NOT_READY during the write and cannot race the sector buffer.
 
----
+### Composite CDC + MSC — why `bDeviceClass = 0xEF`
 
-### Why direct TinyUSB callbacks are used
-
-This project compiles TinyUSB from source as `components/tinyusb`, so the app owns
-the real `tud_msc_*`, `tud_cdc_*`, and descriptor callbacks directly. Do not use
-`--wrap` here. TinyUSB calls `tud_msc_is_writable_cb()` from inside
-`msc_device.c`; direct callback ownership is the clearest way to guarantee the SD
-card is reported writable.
-
-If another component also provides strong TinyUSB callbacks, remove that conflict
-or compile those callbacks out for the test build. Do not rely on
-`--allow-multiple-definition` or link order for MSC writable behavior.
-
----
-
-### Why the DMA bounce buffer must use `heap_caps_aligned_alloc` with `MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL`
-
-`sdmmc_read_sectors()` and `sdmmc_write_sectors()` drive the SPI peripheral via
-the ESP32-S3's GDMA (General DMA) engine. GDMA imposes two constraints:
-
-1. **Internal SRAM only:** GDMA cannot access PSRAM (external SPI RAM). If the
-   buffer is allocated with `heap_caps_malloc(n, MALLOC_CAP_SPIRAM)` or with the
-   default allocator when PSRAM is the primary heap, the DMA transfer will silently
-   read from or write to the wrong address, corrupting data or causing a bus fault.
-
-2. **4-byte alignment:** GDMA descriptors require the buffer start address to be
-   4-byte aligned. `malloc()` and `heap_caps_malloc()` on IDF typically return
-   8-byte aligned addresses, but `heap_caps_aligned_alloc(4, n, caps)` is explicit
-   and immune to future allocator changes.
-
-Using `MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL` together ensures the allocator selects
-a region of internal SRAM that is mapped into the GDMA address space. This is the
-correct pattern for any buffer used directly by a DMA peripheral on ESP32-S3.
-
----
-
-### Why USB starts before SD probing in this test
-
-This test intentionally installs TinyUSB first, then probes the SD card. That
-keeps the CDC console available quickly, even if the SD card is slow, absent, or
-electrically unstable during bring-up.
-
-While the card is not ready, `tud_msc_test_unit_ready_cb()` reports no media and
-the SCSI sense state is set to NOT_READY. After SD probing succeeds, the same MSC
-LUN reports the real sector count and accepts reads/writes. If a host caches the
-early no-media state too aggressively, unplugging and reconnecting the OTG cable
-forces a clean re-enumeration against the now-ready SD card.
-
-For production firmware, the policy can choose either startup mode:
-
-- **Fast diagnostic mode**: USB first, SD second. Best for CDC logs and recovery.
-- **Storage-first mode**: SD first, USB second. Best when the host must see the
-  drive ready immediately on the first enumeration.
-
----
-
-### The boot log buffer pattern
-
-The CDC serial port is not visible to the host until USB enumeration completes and a
-terminal application opens the port (asserts DTR). This happens several hundred
-milliseconds to a few seconds after the board powers up; long after `app_main` has
-run its initialisation sequence.
-
-Without the boot log buffer, all startup messages (SD card identity, DMA buffer
-address, error codes) are lost. A developer opening a terminal after the board has
-booted would have no way to know what happened at startup.
-
-The boot log pattern solves this by accumulating formatted messages into a static
-`char s_boot_log[1024]` buffer. The CDC task accepts the `status` command and
-then replays the boot log followed by live SD and MSC counters. The buffer is
-never cleared; every reconnect can request the same boot-time snapshot.
-
-The buffer is kept small (1024 bytes) to avoid fragmentation. Messages longer than
-the buffer are silently truncated at the buffer boundary.
+Windows requires `bDeviceClass=0xEF / bDeviceSubClass=0x02 / bDeviceProtocol=0x01`
+(Miscellaneous Device Class with Interface Association Descriptors) to correctly
+split CDC and MSC to separate drivers. Without this, Windows may try to load one
+driver for the whole device and fail. The TinyUSB `TUD_CDC_DESCRIPTOR` macro
+emits the IAD automatically.
 
 ---
 
 ## Tested Hardware
 
-| Board              | IDF version | Result                       |
-|--------------------|-------------|------------------------------|
-| ESP32-S3-WROOM-1   | 5.5.1       | Pass - CDC + MSC both work   |
+| Board            | IDF version | SD mode | Result |
+|------------------|-------------|---------|--------|
+| ESP32-S3-WROOM-1 | 5.5.1       | SPI     | Pass — CDC + MSC both work |
 
 SD cards tested: SanDisk Ultra 16 GB SDHC, Samsung EVO 32 GB SDHC.
 
@@ -297,9 +281,7 @@ SD cards tested: SanDisk Ultra 16 GB SDHC, Samsung EVO 32 GB SDHC.
 
 ## License
 
-MIT License
-
-Copyright (c) 2025
+MIT License — Copyright (c) 2025
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
