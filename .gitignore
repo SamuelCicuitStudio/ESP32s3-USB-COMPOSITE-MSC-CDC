@@ -1,8 +1,11 @@
-build/
-managed_components/
-sdkconfig
-sdkconfig.old
-dependencies.lock
+# ESP-IDF outputs for every nested example project.
+**/build/
+**/managed_components/
+**/sdkconfig
+**/sdkconfig.old
+**/dependencies.lock
+
+# Local tooling/editor files.
 *.pyc
 __pycache__/
 .vscode/
