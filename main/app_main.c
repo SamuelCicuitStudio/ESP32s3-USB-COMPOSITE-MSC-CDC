@@ -50,6 +50,7 @@ static const char *TAG = "usb_cdc_msc";
 #define SD_HOST  SPI3_HOST
 #define SD_FREQ  4000000     /* 4 MHz — safe for long wires */
 #define MSC_SECTOR_BUFFER_BYTES 4096U
+#define MSC_VOLUME_LABEL "GEYE"      /* drive name shown in Windows Explorer */
 
 /* ── SD card state ───────────────────────────────────────────────────────── */
 static sdmmc_card_t       s_card;
@@ -94,6 +95,155 @@ static void blog(const char *fmt, ...)
                                            BOOT_LOG_CAP - s_boot_log_len,
                                            "%s\r\n", tmp);
     }
+}
+
+/* ── FAT volume label writer ─────────────────────────────────────────────── */
+/*
+ * sd_set_volume_label — stamps an 11-character FAT volume label onto the card.
+ *
+ * Updates two locations so Windows Explorer shows the name immediately:
+ *   1. BPB VolumeLabel in the boot sector (offset 43 for FAT16/12, 71 for FAT32).
+ *   2. Root-directory entry with ATTR_VOLUME_ID (0x08) — Windows reads this first.
+ *
+ * Called after sdmmc_card_init() but before s_card_ready = true so the USB host
+ * still receives NOT_READY and cannot race us on s_dma_buf.
+ */
+static void sd_set_volume_label(const char *label)
+{
+    /* Format: exactly 11 bytes, uppercase, space-padded, no NUL */
+    uint8_t fmt[11];
+    memset(fmt, ' ', 11);
+    for (int i = 0; i < 11 && label[i]; i++) {
+        char c = label[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        fmt[i] = (uint8_t)c;
+    }
+
+    /* ── Find the FAT VBR ────────────────────────────────────────────────── */
+    if (sdmmc_read_sectors(&s_card, s_dma_buf, 0, 1) != ESP_OK) {
+        ESP_LOGW(TAG, "Label: read sector 0 failed");
+        return;
+    }
+
+    uint32_t fat_lba = 0;
+
+    /* Sector 0 is an MBR (not a VBR) when byte 0 is not a JMP opcode. */
+    if (s_dma_buf[0] != 0xEB && s_dma_buf[0] != 0xE9) {
+        if (s_dma_buf[510] == 0x55 && s_dma_buf[511] == 0xAA) {
+            /* First partition entry LBA start at offset 454 (little-endian) */
+            uint32_t p = (uint32_t)s_dma_buf[454]        |
+                         ((uint32_t)s_dma_buf[455] << 8)  |
+                         ((uint32_t)s_dma_buf[456] << 16) |
+                         ((uint32_t)s_dma_buf[457] << 24);
+            if (p > 0) {
+                fat_lba = p;
+                if (sdmmc_read_sectors(&s_card, s_dma_buf, fat_lba, 1) != ESP_OK) {
+                    ESP_LOGW(TAG, "Label: read VBR@%" PRIu32 " failed", fat_lba);
+                    return;
+                }
+            }
+        }
+    }
+
+    /* Sanity-check the VBR */
+    if ((s_dma_buf[0] != 0xEB && s_dma_buf[0] != 0xE9) ||
+         s_dma_buf[510] != 0x55 || s_dma_buf[511] != 0xAA) {
+        ESP_LOGW(TAG, "Label: sector %" PRIu32 " is not a FAT VBR", fat_lba);
+        return;
+    }
+
+    /* ── Parse BPB ───────────────────────────────────────────────────────── */
+    bool     is_fat32      = (memcmp(s_dma_buf + 82, "FAT32   ", 8) == 0);
+    uint16_t bytes_per_sec = (uint16_t)(s_dma_buf[11] | ((uint16_t)s_dma_buf[12] << 8));
+    uint8_t  sec_per_clus  = s_dma_buf[13];
+    uint16_t rsvd_secs     = (uint16_t)(s_dma_buf[14] | ((uint16_t)s_dma_buf[15] << 8));
+    uint8_t  num_fats      = s_dma_buf[16];
+
+    if (bytes_per_sec != 512 || num_fats == 0) {
+        ESP_LOGW(TAG, "Label: bad BPB bps=%u nf=%u", bytes_per_sec, num_fats);
+        return;
+    }
+
+    /* Root directory geometry — save before we overwrite s_dma_buf */
+    uint32_t root_dir_lba, root_dir_secs;
+
+    if (is_fat32) {
+        uint32_t fat_sz32 = (uint32_t)s_dma_buf[36]        |
+                            ((uint32_t)s_dma_buf[37] << 8)  |
+                            ((uint32_t)s_dma_buf[38] << 16) |
+                            ((uint32_t)s_dma_buf[39] << 24);
+        uint32_t root_clus = (uint32_t)s_dma_buf[44]        |
+                             ((uint32_t)s_dma_buf[45] << 8)  |
+                             ((uint32_t)s_dma_buf[46] << 16) |
+                             ((uint32_t)s_dma_buf[47] << 24);
+        uint32_t first_data = fat_lba + rsvd_secs + (num_fats * fat_sz32);
+        root_dir_lba  = first_data + (root_clus - 2U) * sec_per_clus;
+        root_dir_secs = sec_per_clus;
+    } else {
+        uint16_t fat_sz16 = (uint16_t)(s_dma_buf[22] | ((uint16_t)s_dma_buf[23] << 8));
+        uint16_t root_ent = (uint16_t)(s_dma_buf[17] | ((uint16_t)s_dma_buf[18] << 8));
+        root_dir_lba  = fat_lba + rsvd_secs + ((uint32_t)num_fats * fat_sz16);
+        root_dir_secs = ((uint32_t)root_ent * 32U + 511U) / 512U;
+        if (root_dir_secs == 0) root_dir_secs = 1;
+    }
+
+    /* ── Write BPB label ─────────────────────────────────────────────────── */
+    memcpy(s_dma_buf + (is_fat32 ? 71U : 43U), fmt, 11);
+    if (sdmmc_write_sectors(&s_card, s_dma_buf, fat_lba, 1) != ESP_OK)
+        ESP_LOGW(TAG, "Label: BPB write failed (non-fatal)");
+
+    /* ── Write root-directory volume-label entry ─────────────────────────── */
+    bool     done    = false;
+    uint32_t del_lba = 0, del_off = 0;
+
+    for (uint32_t si = 0; si < root_dir_secs && !done; si++) {
+        if (sdmmc_read_sectors(&s_card, s_dma_buf, root_dir_lba + si, 1) != ESP_OK) break;
+
+        bool dirty = false;
+        for (uint32_t ei = 0; ei < 512U / 32U; ei++) {
+            uint8_t *dir  = s_dma_buf + ei * 32U;
+            uint8_t  first = dir[0];
+            uint8_t  attr  = dir[11];
+
+            if (first == 0x00) {
+                /* End-of-directory: create entry here */
+                memset(dir, 0, 32);
+                memcpy(dir, fmt, 11);
+                dir[11] = 0x08;   /* ATTR_VOLUME_ID */
+                dirty = done = true;
+                break;
+            }
+            if (first == 0xE5) {
+                if (!del_lba) { del_lba = root_dir_lba + si; del_off = ei * 32U; }
+                continue;
+            }
+            if ((attr & 0x0F) == 0x0F) continue;   /* LFN entry — skip */
+
+            if (attr & 0x08) {
+                /* Existing volume-label entry — update in place */
+                memcpy(dir, fmt, 11);
+                dirty = done = true;
+                break;
+            }
+        }
+        if (dirty) sdmmc_write_sectors(&s_card, s_dma_buf, root_dir_lba + si, 1);
+    }
+
+    /* Fall back to first deleted slot if no end-of-dir terminator was found */
+    if (!done && del_lba) {
+        if (sdmmc_read_sectors(&s_card, s_dma_buf, del_lba, 1) == ESP_OK) {
+            uint8_t *dir = s_dma_buf + del_off;
+            memset(dir, 0, 32);
+            memcpy(dir, fmt, 11);
+            dir[11] = 0x08;
+            sdmmc_write_sectors(&s_card, s_dma_buf, del_lba, 1);
+            done = true;
+        }
+    }
+
+    ESP_LOGI(TAG, "Volume label '%.11s' written (FAT%s VBR@%" PRIu32 " root@%" PRIu32 "%s)",
+             (char *)fmt, is_fat32 ? "32" : "16/12", fat_lba, root_dir_lba,
+             done ? "" : " — root dir entry skipped");
 }
 
 /* ── SD initialisation ───────────────────────────────────────────────────── */
@@ -153,6 +303,11 @@ static esp_err_t sd_init(void)
         s_spi_dev = -1;
         return ret;
     }
+
+    /* Stamp the FAT volume label before exposing the card to USB.
+     * s_card_ready is still false so the MSC callbacks return NOT_READY,
+     * keeping s_dma_buf exclusively ours during the label write. */
+    sd_set_volume_label(MSC_VOLUME_LABEL);
 
     s_card_ready = true;
     return ESP_OK;
@@ -693,11 +848,12 @@ void app_main(void)
     if (ret == ESP_OK) {
         uint64_t mb = ((uint64_t)s_card.csd.capacity *
                        s_card.csd.sector_size) / (1024ULL * 1024ULL);
-        blog("SD: READY  name=%s  %" PRIu32 " x %" PRIu32 " B = %" PRIu64 " MB",
+        blog("SD: READY  name=%s  %" PRIu32 " x %" PRIu32 " B = %" PRIu64 " MB  label=%s",
              s_card.cid.name,
              (uint32_t)s_card.csd.capacity,
              (uint32_t)s_card.csd.sector_size,
-             mb);
+             mb,
+             MSC_VOLUME_LABEL);
         blog("SD: type=%s  speed=%d kHz",
              (s_card.ocr & (1UL << 30)) ? "SDHC/SDXC" : "SDSC",
              s_card.real_freq_khz);
