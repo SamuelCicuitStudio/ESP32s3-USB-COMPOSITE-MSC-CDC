@@ -21,4 +21,9 @@
 #define CFG_TUD_MIDI   0
 #define CFG_TUD_VENDOR 0
 
-#define CFG_TUD_MSC_EP_BUFSIZE 512
+/*
+ * 4096 bytes = 8 sectors per USB transfer cycle.
+ * Reduces MSC CBW/data/CSW round-trips by 8x vs the default 512-byte buffer.
+ * Must match MSC_SECTOR_BUFFER_BYTES in app_main.c.
+ */
+#define CFG_TUD_MSC_EP_BUFSIZE 4096

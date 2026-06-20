@@ -466,6 +466,20 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba,
         s_msc_read_errors++;
         return -1;
     }
+
+    /* Fast path: whole-sector aligned multi-sector read (one SPI transaction) */
+    if (offset == 0U && (bufsize % sector_size) == 0U &&
+        bufsize <= MSC_SECTOR_BUFFER_BYTES) {
+        uint32_t count = bufsize / sector_size;
+        if (sdmmc_read_sectors(&s_card, s_dma_buf, lba, count) != ESP_OK) {
+            s_msc_read_errors++;
+            return -1;
+        }
+        memcpy(buffer, s_dma_buf, bufsize);
+        return (int32_t)bufsize;
+    }
+
+    /* Slow path: unaligned or oversized — fall back to sector-by-sector */
     uint8_t *dst = (uint8_t *)buffer;
     uint32_t rem = bufsize;
     uint32_t cur_lba = lba;
@@ -499,6 +513,20 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba,
         s_msc_write_errors++;
         return -1;
     }
+
+    /* Fast path: whole-sector aligned multi-sector write (one SPI transaction) */
+    if (offset == 0U && (bufsize % sector_size) == 0U &&
+        bufsize <= MSC_SECTOR_BUFFER_BYTES) {
+        uint32_t count = bufsize / sector_size;
+        memcpy(s_dma_buf, buffer, bufsize);
+        if (sdmmc_write_sectors(&s_card, s_dma_buf, lba, count) != ESP_OK) {
+            s_msc_write_errors++;
+            return -1;
+        }
+        return (int32_t)bufsize;
+    }
+
+    /* Slow path: unaligned or oversized — fall back to sector-by-sector */
     const uint8_t *src = buffer;
     uint32_t rem = bufsize;
     uint32_t cur_lba = lba;
@@ -560,7 +588,12 @@ int32_t tud_msc_scsi_cb(uint8_t lun, const uint8_t cmd[16],
 static void usb_task(void *arg)
 {
     (void)arg;
-    for (;;) tud_task();
+    /* Yield briefly between iterations so the RTOS watchdog stays fed,
+     * but only when TinyUSB has nothing pending (tud_task returns quickly). */
+    for (;;) {
+        tud_task();
+        taskYIELD();
+    }
 }
 
 /* ── app_main ────────────────────────────────────────────────────────────── */
@@ -589,12 +622,14 @@ void app_main(void)
         s_card_error = true;
     }
 
-    /* Start LED indicator before USB enumerates */
-    xTaskCreate(led_task, "led", 2048, NULL, 1, NULL);
+    /* Start LED indicator on Core 1 — keeps Core 0 free for USB+SD */
+    xTaskCreatePinnedToCore(led_task, "led", 2048, NULL, 1, NULL, 1);
 
-    /* USB after SD — host sees a ready disk on first mount */
+    /* USB after SD — host sees a ready disk on first mount.
+     * Pinned to Core 0 at priority 6 so SD I/O (called from MSC callbacks)
+     * runs on the same core without cross-core scheduler interference. */
     usb_phy_and_tusb_init();
-    xTaskCreate(usb_task, "usb_tud", 8192, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(usb_task, "usb_tud", 8192, NULL, 6, NULL, 0);
 
     for (;;) vTaskDelay(pdMS_TO_TICKS(60000));
 }
