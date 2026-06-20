@@ -11,15 +11,23 @@
  *
  * Startup order: SD first, then USB. The host never sees a NOT_READY state
  * on first mount because the card is probed before USB enumeration starts.
+ *
+ * LED indicator (active LOW): GPIO8=R, GPIO46=G, GPIO3=B
+ *   Off        — no SD card / not ready
+ *   Solid blue — SD ready, USB mounted, idle
+ *   Green blink — write activity
+ *   Blue blink  — read activity (no write)
+ *   Solid red   — SD error
  */
 
 #include <inttypes.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
+#include "esp_err.h"
 #include "esp_heap_caps.h"
-#include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_private/usb_phy.h"
 #include "freertos/FreeRTOS.h"
@@ -28,7 +36,10 @@
 #include "sdmmc_cmd.h"
 #include "tusb.h"
 
-static const char *TAG = "msc_test";
+/* ── RGB LED pin assignment (active LOW) ─────────────────────────────────── */
+#define LED_R   8
+#define LED_G   46
+#define LED_B   3
 
 /* ── SD card pin assignment ──────────────────────────────────────────────── */
 #define SD_SCLK  41
@@ -36,7 +47,7 @@ static const char *TAG = "msc_test";
 #define SD_MISO  42
 #define SD_CS    38
 #define SD_HOST  SPI3_HOST
-#define SD_FREQ  4000000      /* 4 MHz — safe default */
+#define SD_FREQ  20000000     /* 20 MHz */
 
 /* ── USB identity (matches board_config.h production values) ─────────────── */
 #define USB_VID        0xCAFEU
@@ -49,45 +60,85 @@ static const char *TAG = "msc_test";
 /* ── SD state ────────────────────────────────────────────────────────────── */
 static sdmmc_card_t       s_card;
 static bool               s_card_ready = false;
+static bool               s_card_error = false;
 static sdspi_dev_handle_t s_spi_dev    = -1;
 static uint8_t           *s_dma_buf    = NULL;
 static usb_phy_handle_t   s_phy;
 
-/* ── Counters ────────────────────────────────────────────────────────────── */
+/* ── Counters (sampled by led_task — zero overhead in MSC hot path) ──────── */
 static volatile uint32_t  s_msc_read_calls;
 static volatile uint32_t  s_msc_read_errors;
 static volatile uint32_t  s_msc_write_calls;
 static volatile uint32_t  s_msc_write_errors;
-static volatile uint32_t  s_msc_scsi_errors;
-static volatile uint32_t  s_msc_last_lba;
-static volatile esp_err_t s_msc_last_error = ESP_OK;
 
 static char s_usb_serial[13];
 
-/* ── Status print ────────────────────────────────────────────────────────── */
-static void print_status(const char *event)
+/* ── LED helpers ─────────────────────────────────────────────────────────── */
+static void led_init(void)
 {
-    ESP_LOGI(TAG, "--- %s ---", event);
-    if (!s_card_ready) {
-        ESP_LOGI(TAG, "SD : NOT READY");
-        return;
+    const gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << LED_R) | (1ULL << LED_G) | (1ULL << LED_B),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    /* All off initially (HIGH = off for active-low LEDs) */
+    gpio_set_level(LED_R, 1);
+    gpio_set_level(LED_G, 1);
+    gpio_set_level(LED_B, 1);
+}
+
+/* r/g/b: true = LED on */
+static inline void led_rgb(bool r, bool g, bool b)
+{
+    gpio_set_level(LED_R, r ? 0 : 1);
+    gpio_set_level(LED_G, g ? 0 : 1);
+    gpio_set_level(LED_B, b ? 0 : 1);
+}
+
+/* ── LED indicator task ──────────────────────────────────────────────────── */
+/*
+ * Runs at priority 1, samples read/write counters every 100 ms.
+ * No mutex needed — counters are written by TinyUSB task, read here.
+ * States:
+ *   Off        : SD not ready
+ *   Solid red  : SD error
+ *   Green blink: write activity detected since last sample
+ *   Blue blink : read activity only
+ *   Solid blue : mounted and idle
+ */
+static void led_task(void *arg)
+{
+    (void)arg;
+    uint32_t last_read  = 0;
+    uint32_t last_write = 0;
+    bool     blink_phase = false;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        uint32_t cur_read  = s_msc_read_calls;
+        uint32_t cur_write = s_msc_write_calls;
+        bool read_active   = (cur_read  != last_read);
+        bool write_active  = (cur_write != last_write);
+        last_read  = cur_read;
+        last_write = cur_write;
+        blink_phase = !blink_phase;
+
+        if (s_card_error) {
+            led_rgb(true, false, false);          /* solid red — error */
+        } else if (!s_card_ready) {
+            led_rgb(false, false, false);          /* off — no card */
+        } else if (write_active) {
+            led_rgb(false, blink_phase, false);    /* green blink — writing */
+        } else if (read_active) {
+            led_rgb(false, false, blink_phase);    /* blue blink — reading */
+        } else {
+            led_rgb(false, false, true);           /* solid blue — idle */
+        }
     }
-    const char *type = (s_card.ocr & (1UL << 30)) ? "SDHC/SDXC" : "SDSC";
-    const uint64_t mb = ((uint64_t)s_card.csd.capacity *
-                          s_card.csd.sector_size) / (1024ULL * 1024ULL);
-    ESP_LOGI(TAG, "SD : name=%s type=%s speed=%d kHz",
-             s_card.cid.name, type, s_card.real_freq_khz);
-    ESP_LOGI(TAG, "CAP: %" PRIu32 " x %" PRIu32 " B = %" PRIu64 " MB  label=%s",
-             (uint32_t)s_card.csd.capacity,
-             (uint32_t)s_card.csd.sector_size,
-             mb, MSC_VOLUME_LABEL);
-    ESP_LOGI(TAG, "MSC: R=%" PRIu32 "/%" PRIu32 " W=%" PRIu32 "/%" PRIu32,
-             (uint32_t)s_msc_read_calls, (uint32_t)s_msc_read_errors,
-             (uint32_t)s_msc_write_calls, (uint32_t)s_msc_write_errors);
-    ESP_LOGI(TAG, "ERR: scsi=%" PRIu32 " last_lba=%" PRIu32 " last=%s",
-             (uint32_t)s_msc_scsi_errors,
-             (uint32_t)s_msc_last_lba,
-             esp_err_to_name((esp_err_t)s_msc_last_error));
 }
 
 /* ── FAT volume label writer ─────────────────────────────────────────────── */
@@ -101,10 +152,7 @@ static void sd_set_volume_label(const char *label)
         fmt[i] = (uint8_t)c;
     }
 
-    if (sdmmc_read_sectors(&s_card, s_dma_buf, 0, 1) != ESP_OK) {
-        ESP_LOGW(TAG, "Label: read sector 0 failed");
-        return;
-    }
+    if (sdmmc_read_sectors(&s_card, s_dma_buf, 0, 1) != ESP_OK) return;
 
     uint32_t fat_lba = 0;
     if (s_dma_buf[0] != 0xEB && s_dma_buf[0] != 0xE9) {
@@ -115,17 +163,13 @@ static void sd_set_volume_label(const char *label)
                          ((uint32_t)s_dma_buf[457] << 24);
             if (p > 0U) {
                 fat_lba = p;
-                if (sdmmc_read_sectors(&s_card, s_dma_buf, fat_lba, 1) != ESP_OK) {
-                    ESP_LOGW(TAG, "Label: read VBR@%" PRIu32 " failed", fat_lba);
-                    return;
-                }
+                if (sdmmc_read_sectors(&s_card, s_dma_buf, fat_lba, 1) != ESP_OK) return;
             }
         }
     }
 
     if ((s_dma_buf[0] != 0xEB && s_dma_buf[0] != 0xE9) ||
         s_dma_buf[510] != 0x55 || s_dma_buf[511] != 0xAA) {
-        ESP_LOGW(TAG, "Label: sector %" PRIu32 " is not a FAT VBR", fat_lba);
         return;
     }
 
@@ -135,10 +179,7 @@ static void sd_set_volume_label(const char *label)
     const uint16_t rsvd = (uint16_t)(s_dma_buf[14] | ((uint16_t)s_dma_buf[15] << 8));
     const uint8_t  nfat = s_dma_buf[16];
 
-    if (bps != 512 || spc == 0 || nfat == 0) {
-        ESP_LOGW(TAG, "Label: bad BPB bps=%u spc=%u nf=%u", bps, spc, nfat);
-        return;
-    }
+    if (bps != 512 || spc == 0 || nfat == 0) return;
 
     uint32_t root_lba, root_secs;
     if (is_fat32) {
@@ -159,8 +200,7 @@ static void sd_set_volume_label(const char *label)
 
     /* Write BPB label */
     memcpy(s_dma_buf + (is_fat32 ? 71U : 43U), fmt, sizeof(fmt));
-    if (sdmmc_write_sectors(&s_card, s_dma_buf, fat_lba, 1) != ESP_OK)
-        ESP_LOGW(TAG, "Label: BPB write failed (non-fatal)");
+    sdmmc_write_sectors(&s_card, s_dma_buf, fat_lba, 1);
 
     /* Write root-directory ATTR_VOLUME_ID entry */
     bool     done    = false;
@@ -195,8 +235,6 @@ static void sd_set_volume_label(const char *label)
             sdmmc_write_sectors(&s_card, s_dma_buf, del_lba, 1);
         }
     }
-    ESP_LOGI(TAG, "Label: %.11s  FAT%s  VBR@%" PRIu32 "  root@%" PRIu32,
-             (const char *)fmt, is_fat32 ? "32" : "16/12", fat_lba, root_lba);
 }
 
 /* ── SD initialisation ───────────────────────────────────────────────────── */
@@ -214,16 +252,10 @@ static esp_err_t sd_init(void)
         .flags           = SPICOMMON_BUSFLAG_MASTER,
     };
     esp_err_t ret = spi_bus_initialize(SD_HOST, &bus, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) return ret;
 
     ret = sdspi_host_init();
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "sdspi_host_init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) return ret;
 
     sdspi_device_config_t dev = SDSPI_DEVICE_CONFIG_DEFAULT();
     dev.host_id  = SD_HOST;
@@ -233,19 +265,15 @@ static esp_err_t sd_init(void)
     dev.gpio_int = SDSPI_SLOT_NO_INT;
 
     ret = sdspi_host_init_device(&dev, &s_spi_dev);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "sdspi attach failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
+    if (ret != ESP_OK) return ret;
 
-    sdmmc_host_t host   = SDSPI_HOST_DEFAULT();
-    host.slot           = s_spi_dev;
-    host.max_freq_khz   = SD_FREQ / 1000U;
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot         = s_spi_dev;
+    host.max_freq_khz = SD_FREQ / 1000U;
 
     memset(&s_card, 0, sizeof(s_card));
     ret = sdmmc_card_init(&host, &s_card);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "sdmmc_card_init failed: %s — check wiring", esp_err_to_name(ret));
         sdspi_host_remove_device(s_spi_dev);
         s_spi_dev = -1;
         return ret;
@@ -363,17 +391,12 @@ const uint16_t *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
 }
 
 /* ── TinyUSB event callbacks ─────────────────────────────────────────────── */
-void tud_mount_cb(void) { }
-void tud_umount_cb(void) { }
+void tud_mount_cb(void)   { }
+void tud_umount_cb(void)  { }
 void tud_suspend_cb(bool remote_wakeup_en) { (void)remote_wakeup_en; }
-void tud_resume_cb(void) { }
+void tud_resume_cb(void)  { }
 
 /* ── MSC callbacks ───────────────────────────────────────────────────────── */
-/*
- * All TinyUSB MSC callbacks are defined here as the only definitions in the
- * build. This example owns the MSC callbacks and links TinyUSB directly.
- */
-
 uint8_t tud_msc_get_maxlun_cb(void) { return 0; }
 
 void tud_msc_inquiry_cb(uint8_t lun,
@@ -436,15 +459,11 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba,
     s_msc_read_calls++;
     if (lun != 0 || !s_card_ready || !s_dma_buf || !buffer) {
         s_msc_read_errors++;
-        s_msc_last_lba = lba;
-        s_msc_last_error = ESP_ERR_INVALID_STATE;
         return -1;
     }
     const uint32_t sector_size = (uint32_t)s_card.csd.sector_size;
     if (sector_size == 0U || sector_size > MSC_SECTOR_BUFFER_BYTES || offset >= sector_size) {
         s_msc_read_errors++;
-        s_msc_last_lba = lba;
-        s_msc_last_error = ESP_ERR_INVALID_ARG;
         return -1;
     }
     uint8_t *dst = (uint8_t *)buffer;
@@ -454,11 +473,8 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba,
     while (rem > 0U) {
         uint32_t room  = sector_size - cur_off;
         uint32_t chunk = rem < room ? rem : room;
-        esp_err_t rc = sdmmc_read_sectors(&s_card, s_dma_buf, cur_lba, 1);
-        if (rc != ESP_OK) {
+        if (sdmmc_read_sectors(&s_card, s_dma_buf, cur_lba, 1) != ESP_OK) {
             s_msc_read_errors++;
-            s_msc_last_lba   = cur_lba;
-            s_msc_last_error = rc;
             return -1;
         }
         memcpy(dst, s_dma_buf + cur_off, chunk);
@@ -476,15 +492,11 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba,
     s_msc_write_calls++;
     if (lun != 0 || !s_card_ready || !s_dma_buf || !buffer) {
         s_msc_write_errors++;
-        s_msc_last_lba   = lba;
-        s_msc_last_error = ESP_ERR_INVALID_STATE;
         return -1;
     }
     const uint32_t sector_size = (uint32_t)s_card.csd.sector_size;
     if (sector_size == 0U || sector_size > MSC_SECTOR_BUFFER_BYTES || offset >= sector_size) {
         s_msc_write_errors++;
-        s_msc_last_lba   = lba;
-        s_msc_last_error = ESP_ERR_INVALID_ARG;
         return -1;
     }
     const uint8_t *src = buffer;
@@ -497,20 +509,14 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba,
         if (cur_off == 0U && chunk == sector_size) {
             memcpy(s_dma_buf, src, sector_size);
         } else {
-            esp_err_t rc = sdmmc_read_sectors(&s_card, s_dma_buf, cur_lba, 1);
-            if (rc != ESP_OK) {
+            if (sdmmc_read_sectors(&s_card, s_dma_buf, cur_lba, 1) != ESP_OK) {
                 s_msc_write_errors++;
-                s_msc_last_lba   = cur_lba;
-                s_msc_last_error = rc;
                 return -1;
             }
             memcpy(s_dma_buf + cur_off, src, chunk);
         }
-        esp_err_t rc = sdmmc_write_sectors(&s_card, s_dma_buf, cur_lba, 1);
-        if (rc != ESP_OK) {
+        if (sdmmc_write_sectors(&s_card, s_dma_buf, cur_lba, 1) != ESP_OK) {
             s_msc_write_errors++;
-            s_msc_last_lba   = cur_lba;
-            s_msc_last_error = rc;
             return -1;
         }
         src += chunk;
@@ -545,7 +551,6 @@ int32_t tud_msc_scsi_cb(uint8_t lun, const uint8_t cmd[16],
         (void)buffer; (void)bufsize;
         return 0;
     default:
-        s_msc_scsi_errors++;
         tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
         return -1;
     }
@@ -561,8 +566,7 @@ static void usb_task(void *arg)
 /* ── app_main ────────────────────────────────────────────────────────────── */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "=== Geye MSC-only SD test ===");
-    ESP_LOGI(TAG, "Console: UART0/FTDI only — native USB = MSC disk");
+    led_init();
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -575,27 +579,22 @@ void app_main(void)
     s_dma_buf = heap_caps_aligned_alloc(4, MSC_SECTOR_BUFFER_BYTES,
                                         MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (!s_dma_buf) {
-        ESP_LOGE(TAG, "DMA buffer alloc failed — halting");
+        s_card_error = true;
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    ESP_LOGI(TAG, "DMA buf: %p (%u B, internal SRAM)",
-             (void *)s_dma_buf, (unsigned)MSC_SECTOR_BUFFER_BYTES);
 
     /* SD first — card ready before USB host ever polls MSC */
-    ESP_LOGI(TAG, "SD: SPI3  CS=%d SCK=%d MISO=%d MOSI=%d  %d Hz",
-             SD_CS, SD_SCLK, SD_MISO, SD_MOSI, SD_FREQ);
     ret = sd_init();
-    if (ret == ESP_OK) {
-        print_status("SD ready");
-    } else {
-        ESP_LOGE(TAG, "SD init failed (%s) — MSC will report no media",
-                 esp_err_to_name(ret));
+    if (ret != ESP_OK) {
+        s_card_error = true;
     }
+
+    /* Start LED indicator before USB enumerates */
+    xTaskCreate(led_task, "led", 2048, NULL, 1, NULL);
 
     /* USB after SD — host sees a ready disk on first mount */
     usb_phy_and_tusb_init();
     xTaskCreate(usb_task, "usb_tud", 8192, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "Ready — plug native USB OTG cable");
     for (;;) vTaskDelay(pdMS_TO_TICKS(60000));
 }
